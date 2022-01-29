@@ -1,0 +1,209 @@
+---
+title: "Predicting Board Game Rating - Tidy Tuesday Week 4 2022"
+date: "`r Sys.Date()`"
+output:
+    rmdformats::robobook:
+    code_folding: show
+    self_contained: true
+    thumbnails: false
+    lightbox: true
+pkgdown:
+  as_is: true   
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+load(file = "ratings.rda")
+load(file = "details.rda")
+pacman::p_load(tidymodels,tidyverse,tidytext,textrecipes)
+boardgame <- left_join(details, ratings, by = c("id"))
+boardgame$boardgamecategory <- gsub("\\[|\\]","",boardgame$boardgamecategory)
+boardgame$boardgamecategory <- gsub("\\'","", boardgame$boardgamecategory)
+theme_set(theme_minimal())
+```
+
+# Aim 
+
+This project will attempt to predict board game rating from the
+game category, using the
+[Tidy Tuesday week 4 data on board games.](https://github.com/rfordatascience/tidytuesday/blob/master/data/2022/2022-01-25/readme.md)
+
+
+# Data Exploration
+
+Lets take a look at the distribution of the ratings in our dataset:
+
+```{r}
+boardgame %>% ggplot(aes(average))+
+  geom_histogram(fill="midnightblue", alpha=.8, bins=40)
+```
+
+
+It would also be interesting to look at the most common board game 
+category:
+
+```{r}
+tidy_board <- 
+  boardgame %>% 
+  unnest_tokens(word,boardgamecategory)
+
+tidy_board %>% 
+  count(word,sort = TRUE) %>% filter(word != "game")
+```
+ 
+It seems that card, war, and fantasy games are well represented. We can 
+further explore the categories by looking at the mean rating by 
+category:
+
+```{r}
+tidy_board %>%
+  group_by(word) %>%
+  filter(word != "game") %>% 
+  summarise(
+    n = n(),
+    rating = mean(average)
+  ) %>%
+  ggplot(aes(n, rating)) +
+  geom_hline(
+    yintercept = mean(boardgame$average), lty = 2,
+    color = "gray50", size = 1.5
+  ) +
+  geom_jitter(color = "midnightblue", alpha = 0.7) +
+  geom_text(aes(label = word),
+            check_overlap = TRUE, 
+            vjust = "top", hjust = "left"
+  )
+```
+
+# Building the Models
+
+Lets do some feature engineering for the boardgamecategory 
+variable. The tidymodels framework allows for some flexibility in terms
+of feature engineering, in this case we need to incorporate a custom
+feature engineering function to accomodate the structure of the 
+variable.Lets start by creating the splits:
+
+```{r}
+set.seed(123)
+board_split <- initial_split(boardgame, strata = average)
+board_train <- training(board_split)
+board_test <- testing(board_split)
+
+set.seed(234)
+board_folds <- vfold_cv(board_train, strata = average)
+board_folds
+```
+
+Now that we have the respective splits, lets crate our custom feature
+engineering function, along with the recipe for our workflow:
+
+```{r}
+clean_category <- function(x) {
+  x %>%
+    str_split(", ") %>%
+    map(str_remove_all, "[:punct:]") %>%
+    map(str_squish) %>%
+    map(str_to_lower) %>%
+    map(str_replace_all, " ", "_")
+}
+
+board_rec <-
+  recipe(average ~ boardgamecategory, data = boardgame) %>%
+  step_tokenize(boardgamecategory, custom_token = clean_category) %>%
+  step_tokenfilter(boardgamecategory, max_tokens = 50) %>%
+  step_tfidf(boardgamecategory)
+
+# Check that the steps worked as envisioned:
+prep(board_rec) %>% bake(new_data=NULL) %>% str()
+```
+
+Now lets create the model specifications for our two models:
+
+```{r}
+# A random forest model 
+rf_spec <- 
+  rand_forest(trees=500) %>% 
+  set_mode("regression")
+
+# A svm model
+svm_spec <-
+  svm_linear() %>%
+  set_mode("regression")
+
+svm_spec 
+```
+
+Next we join the recipes with a workflow:
+
+```{r}
+# The svm workflow
+svm_wf <- workflow(board_rec, svm_spec)
+# The random forest workflow
+rf_wf <- workflow(board_rec, rf_spec)
+```
+
+# Model Evaluation
+
+Its time to evaluate the models and see how their performance comapares
+to each other, starting by fitting the models:
+
+```{r}
+
+doParallel::registerDoParallel()
+contrl_preds <- control_resamples(save_pred = TRUE)
+
+svm_rs <- fit_resamples(
+  svm_wf,
+  resamples = board_folds,
+  control = contrl_preds
+)
+
+ranger_rs <- fit_resamples(
+  rf_wf,
+  resamples = board_folds,
+  control = contrl_preds
+)
+
+```
+
+Collecting the models will enable the comparison of metrics:
+
+```{r}
+collect_metrics(svm_rs)
+collect_metrics(ranger_rs)
+```
+
+The odels are not very good, but lets compare the predicted results to
+the true values:
+
+```{r}
+bind_rows(
+  collect_predictions(svm_rs) %>%
+    mutate(mod = "SVM"),
+  collect_predictions(ranger_rs) %>%
+    mutate(mod = "ranger")
+) %>%
+  ggplot(aes(average, .pred, color = id)) +
+  geom_jitter(width = 0.5, alpha = 0.5) +
+  geom_abline(lty = 2, color = "gray50", size = 1.2) +
+  facet_wrap(vars(mod)) +
+  coord_fixed()
+```
+
+Lets go with the random forest for the final fit:
+
+```{r}
+final_fitted <- last_fit(rf_wf, board_split)
+collect_metrics(final_fitted)
+```
+
+This fitted workflow object can now be used for predition. Lets predict
+the rating for the 100th entry:
+
+```{r}
+final_wf <- extract_workflow(final_fitted)
+predict(final_wf, board_test[100, ])
+```
+
